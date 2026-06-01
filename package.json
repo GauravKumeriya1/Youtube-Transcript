@@ -1,0 +1,20 @@
+{
+  "name": "youtubetranscriptdownloader",
+  "version": "1.0.0",
+  "description": "Extract YouTube transcripts instantly",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "undici": "^6.19.2",
+    "youtube-captions-scraper": "^2.0.3",
+    "youtube-transcript": "^1.3.1"
+  }
+}
