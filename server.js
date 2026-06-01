@@ -87,6 +87,39 @@ async function fetchTranscriptDirect(videoId, agent) {
   return transcript;
 }
 
+/* ── Paid Transcript API Fallback ───────────────────────── */
+async function fetchFromTranscriptAPI(videoId) {
+  const apiKey = process.env.TRANSCRIPT_API_KEY;
+  if (!apiKey) return null;
+
+  const url = `https://transcriptapi.com/api/v2/youtube/transcript?video_url=${videoId}&format=json`;
+  const response = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`
+    }
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      console.warn(`[TranscriptAPI] No transcript available for video ${videoId} (404).`);
+      return null;
+    }
+    const errText = await response.text().catch(() => response.statusText);
+    throw new Error(`TranscriptAPI status ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  if (data.transcript && data.transcript.length > 0) {
+    return data.transcript.map(t => ({
+      offset: t.start,
+      duration: t.duration,
+      text: t.text,
+      lang: data.metadata?.language || 'en'
+    }));
+  }
+  return null;
+}
+
 /* ── Proxy Loader Helpers ───────────────────────────────── */
 async function getProxies() {
   const proxies = [];
@@ -239,6 +272,7 @@ const server = http.createServer(async (req, res) => {
 
       // Fetch transcript content
       let transcript = null;
+      const errors = {};
 
       // Try Method 1: Direct page scrape with proxy retries
       const maxDirectProxyAttempts = Math.min(3, shuffledProxies.length);
@@ -254,6 +288,7 @@ const server = http.createServer(async (req, res) => {
           }
         } catch (err) {
           console.warn(`[Direct Proxy Attempt failed]: ${err.message}`);
+          errors[`proxy_${proxyIp}`] = err.message;
         }
       }
 
@@ -264,6 +299,7 @@ const server = http.createServer(async (req, res) => {
           transcript = await fetchTranscriptDirect(videoId, undefined);
         } catch (err1) {
           console.warn(`[Direct] Failed WITHOUT proxy: ${err1.message}`);
+          errors['direct_no_proxy'] = err1.message;
 
           // Fallback: youtube-transcript library (always WITHOUT proxy)
           try {
@@ -271,7 +307,19 @@ const server = http.createServer(async (req, res) => {
             transcript = await YoutubeTranscript.fetchTranscript(videoId);
           } catch (err2) {
             console.warn(`[Library] Failed: ${err2.message}`);
+            errors['library'] = err2.message;
           }
+        }
+      }
+
+      // Final Fallback: Paid TranscriptAPI.com if configured
+      if (!transcript && process.env.TRANSCRIPT_API_KEY) {
+        try {
+          console.log(`[TranscriptAPI] Trying fetchFromTranscriptAPI`);
+          transcript = await fetchFromTranscriptAPI(videoId);
+        } catch (err3) {
+          console.warn(`[TranscriptAPI] Failed: ${err3.message}`);
+          errors['transcript_api'] = err3.message;
         }
       }
 
@@ -304,7 +352,11 @@ const server = http.createServer(async (req, res) => {
         }));
       } else {
         res.writeHead(400);
-        res.end(JSON.stringify({ success: false, error: 'Could not extract transcript. The video may not have captions available.' }));
+        res.end(JSON.stringify({ 
+          success: false, 
+          error: 'Could not extract transcript. The video may not have captions available.',
+          details: errors
+        }));
       }
     } catch (err) {
       res.writeHead(500);
