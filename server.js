@@ -35,64 +35,76 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
 ];
 
-/* ── Direct page-scrape transcript fetcher ─────────────── */
 async function fetchTranscriptDirect(videoId) {
-  const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-  const dispatcher = getRandomProxyAgent();
+  const shuffledProxies = [...PROXY_LIST].sort(() => Math.random() - 0.5);
+  let lastError = null;
 
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      'User-Agent': ua,
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-    dispatcher
-  });
+  for (const proxyUrl of shuffledProxies) {
+    const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    const dispatcher = new ProxyAgent(proxyUrl);
 
-  if (!pageRes.ok) throw new Error(`YouTube page returned ${pageRes.status}`);
-  const html = await pageRes.text();
+    try {
+      const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+        headers: {
+          'User-Agent': ua,
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html,application/xhtml+xml',
+        },
+        dispatcher
+      });
 
-  const captionsMatch = html.match(/"captions":\s*(\{.*?"playerCaptionsTracklistRenderer".*?\})\s*,\s*"videoDetails"/s);
-  if (!captionsMatch) {
-    if (html.includes('"playabilityStatus"') && html.includes('"reason"')) {
-      throw new Error('VIDEO_UNAVAILABLE');
+      if (!pageRes.ok) throw new Error(`YouTube page returned ${pageRes.status}`);
+      const html = await pageRes.text();
+
+      const captionsMatch = html.match(/"captions":\s*(\{.*?"playerCaptionsTracklistRenderer".*?\})\s*,\s*"videoDetails"/s);
+      if (!captionsMatch) {
+        if (html.includes('"playabilityStatus"') && html.includes('"reason"')) {
+          throw new Error('VIDEO_UNAVAILABLE');
+        }
+        throw new Error('CAPTIONS_NOT_AVAILABLE');
+      }
+
+      let captionsData;
+      try { captionsData = JSON.parse(captionsMatch[1]); } catch { throw new Error('CAPTIONS_PARSE_ERROR'); }
+
+      const tracks = captionsData?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (!tracks || tracks.length === 0) throw new Error('CAPTIONS_DISABLED');
+
+      let track = tracks.find(t => t.languageCode === 'en' && t.kind !== 'asr');
+      if (!track) track = tracks.find(t => t.languageCode === 'en');
+      if (!track) track = tracks.find(t => t.languageCode?.startsWith('en'));
+      if (!track) track = tracks[0];
+
+      const captionRes = await fetch(track.baseUrl + '&fmt=json3', {
+        headers: { 'User-Agent': ua },
+        dispatcher
+      });
+      if (!captionRes.ok) throw new Error(`Caption fetch returned ${captionRes.status}`);
+
+      const captionData = await captionRes.json();
+      const events = captionData?.events;
+      if (!events || events.length === 0) throw new Error('CAPTIONS_EMPTY');
+
+      const transcript = events
+        .filter(e => e.segs && e.segs.length > 0)
+        .map(e => ({
+          text: e.segs.map(s => s.utf8).join('').trim(),
+          offset: e.tStartMs || 0,
+          duration: e.dDurationMs || 0,
+          lang: track.languageCode
+        }))
+        .filter(t => t.text.length > 0);
+
+      if (transcript.length === 0) throw new Error('CAPTIONS_EMPTY');
+      return transcript;
+
+    } catch (err) {
+      console.warn(`Proxy ${proxyUrl.split('@')[1]} failed: ${err.message}`);
+      lastError = err;
     }
-    throw new Error('CAPTIONS_NOT_AVAILABLE');
   }
 
-  let captionsData;
-  try { captionsData = JSON.parse(captionsMatch[1]); } catch { throw new Error('CAPTIONS_PARSE_ERROR'); }
-
-  const tracks = captionsData?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks || tracks.length === 0) throw new Error('CAPTIONS_DISABLED');
-
-  let track = tracks.find(t => t.languageCode === 'en' && t.kind !== 'asr');
-  if (!track) track = tracks.find(t => t.languageCode === 'en');
-  if (!track) track = tracks.find(t => t.languageCode?.startsWith('en'));
-  if (!track) track = tracks[0];
-
-  const captionRes = await fetch(track.baseUrl + '&fmt=json3', {
-    headers: { 'User-Agent': ua },
-    dispatcher
-  });
-  if (!captionRes.ok) throw new Error(`Caption fetch returned ${captionRes.status}`);
-
-  const captionData = await captionRes.json();
-  const events = captionData?.events;
-  if (!events || events.length === 0) throw new Error('CAPTIONS_EMPTY');
-
-  const transcript = events
-    .filter(e => e.segs && e.segs.length > 0)
-    .map(e => ({
-      text: e.segs.map(s => s.utf8).join('').trim(),
-      offset: e.tStartMs || 0,
-      duration: e.dDurationMs || 0,
-      lang: track.languageCode
-    }))
-    .filter(t => t.text.length > 0);
-
-  if (transcript.length === 0) throw new Error('CAPTIONS_EMPTY');
-  return transcript;
+  throw lastError || new Error('All proxies failed');
 }
 
 /* ── Transcript API ─────────────────────────────────────── */
