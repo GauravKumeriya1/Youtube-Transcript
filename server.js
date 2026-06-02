@@ -2,7 +2,6 @@ import express from 'express';
 import { YoutubeTranscript } from 'youtube-transcript';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
 import { ProxyAgent } from 'undici';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,55 +12,22 @@ const PORT = 3001;
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-/* ── Proxy Loader Helpers ───────────────────────────────── */
-async function getProxies() {
-  const proxies = [];
+const PROXY_LIST = [
+  'http://ltctkkmj:m030l2q44zry@38.154.203.95:5863',
+  'http://ltctkkmj:m030l2q44zry@198.105.121.200:6462',
+  'http://ltctkkmj:m030l2q44zry@64.137.96.74:6641',
+  'http://ltctkkmj:m030l2q44zry@209.127.138.10:5784',
+  'http://ltctkkmj:m030l2q44zry@38.154.185.97:6370',
+  'http://ltctkkmj:m030l2q44zry@84.247.60.125:6095',
+  'http://ltctkkmj:m030l2q44zry@142.111.67.146:5611',
+  'http://ltctkkmj:m030l2q44zry@191.96.254.138:6185',
+  'http://ltctkkmj:m030l2q44zry@31.58.9.4:6077',
+  'http://ltctkkmj:m030l2q44zry@64.137.10.153:5803'
+];
 
-  // 1. Try from environment variable PROXIES or PROXY_LIST
-  if (process.env.PROXIES) {
-    const list = process.env.PROXIES.split(',').map(p => p.trim()).filter(Boolean);
-    proxies.push(...list);
-  } else if (process.env.PROXY_LIST) {
-    const list = process.env.PROXY_LIST.split(',').map(p => p.trim()).filter(Boolean);
-    proxies.push(...list);
-  }
-
-  // 2. Try from local proxies.txt file
-  try {
-    const txtPath = path.join(process.cwd(), 'proxies.txt');
-    if (fs.existsSync(txtPath)) {
-      const content = fs.readFileSync(txtPath, 'utf8');
-      const list = content.split('\n').map(p => p.trim()).filter(p => p && !p.startsWith('#'));
-      proxies.push(...list);
-    }
-  } catch (err) {
-    console.warn('[Proxy Loader] Error reading proxies.txt:', err.message);
-  }
-
-  return [...new Set(proxies)];
-}
-
-function createProxyAgent(proxyStr) {
-  try {
-    if (proxyStr.startsWith('http://') || proxyStr.startsWith('https://')) {
-      return new ProxyAgent({ uri: proxyStr });
-    }
-    const parts = proxyStr.split(':');
-    const ip = parts[0];
-    const port = parts[1];
-    const user = parts[2];
-    const pass = parts[3];
-    if (ip && port) {
-      let proxyUrl = `http://${ip}:${port}`;
-      if (user && pass) {
-        proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-      }
-      return new ProxyAgent({ uri: proxyUrl });
-    }
-  } catch (error) {
-    console.error('[ProxyAgent] Error creating agent:', error);
-  }
-  return undefined;
+function getRandomProxyAgent() {
+  const url = PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
+  return new ProxyAgent(url);
 }
 
 const USER_AGENTS = [
@@ -70,22 +36,18 @@ const USER_AGENTS = [
 ];
 
 /* ── Direct page-scrape transcript fetcher ─────────────── */
-async function fetchTranscriptDirect(videoId, agent) {
+async function fetchTranscriptDirect(videoId) {
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const dispatcher = getRandomProxyAgent();
 
-  const fetchOptions = {
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
     headers: {
       'User-Agent': ua,
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept': 'text/html,application/xhtml+xml',
-    }
-  };
-
-  if (agent) {
-    fetchOptions.dispatcher = agent;
-  }
-
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, fetchOptions);
+    },
+    dispatcher
+  });
 
   if (!pageRes.ok) throw new Error(`YouTube page returned ${pageRes.status}`);
   const html = await pageRes.text();
@@ -109,13 +71,10 @@ async function fetchTranscriptDirect(videoId, agent) {
   if (!track) track = tracks.find(t => t.languageCode?.startsWith('en'));
   if (!track) track = tracks[0];
 
-  const captionOptions = {
-    headers: { 'User-Agent': ua }
-  };
-  if (agent) {
-    captionOptions.dispatcher = agent;
-  }
-  const captionRes = await fetch(track.baseUrl + '&fmt=json3', captionOptions);
+  const captionRes = await fetch(track.baseUrl + '&fmt=json3', {
+    headers: { 'User-Agent': ua },
+    dispatcher
+  });
   if (!captionRes.ok) throw new Error(`Caption fetch returned ${captionRes.status}`);
 
   const captionData = await captionRes.json();
@@ -149,85 +108,29 @@ app.get('/api/transcript', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid YouTube URL' });
     }
 
-    // Load proxies and shuffle
-    const proxies = await getProxies();
-    const shuffledProxies = [...proxies].sort(() => Math.random() - 0.5);
-
     // Fetch video metadata via oEmbed
     let title = '', author = '';
-    const tryFetchMetadata = async (agent) => {
-      const fetchOptions = {};
-      if (agent) {
-        fetchOptions.dispatcher = agent;
-      }
+    try {
+      const canonical = `https://www.youtube.com/watch?v=${videoId}`;
       const oembedRes = await fetch(
-        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-        fetchOptions
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`
       );
-      if (oembedRes.ok) {
-        return await oembedRes.json();
-      }
-      throw new Error(`oEmbed failed status ${oembedRes.status}`);
-    };
+      const info = await oembedRes.json();
+      title = info.title || '';
+      author = info.author_name || '';
+    } catch (_) { /* metadata is optional */ }
 
-    let metadata = null;
-    const maxMetadataProxyAttempts = Math.min(3, shuffledProxies.length);
-    for (let i = 0; i < maxMetadataProxyAttempts; i++) {
-      try {
-        const agent = createProxyAgent(shuffledProxies[i]);
-        if (agent) {
-          metadata = await tryFetchMetadata(agent);
-          if (metadata) break;
-        }
-      } catch (err) {
-        console.warn(`[Metadata Proxy Attempt failed]: ${err.message}`);
-      }
-    }
-
-    if (!metadata) {
-      try {
-        metadata = await tryFetchMetadata(undefined);
-      } catch (err) {
-        console.warn(`[Metadata WITHOUT proxy failed]: ${err.message}`);
-      }
-    }
-
-    if (metadata) {
-      title = metadata.title || '';
-      author = metadata.author_name || '';
-    }
-
-    // Try Method 1: Direct page scrape (most reliable with proxy)
+    // Try Method 1: Direct page scrape
     let transcript = null;
-    const maxDirectProxyAttempts = Math.min(3, shuffledProxies.length);
-    for (let i = 0; i < maxDirectProxyAttempts; i++) {
+    try {
+      transcript = await fetchTranscriptDirect(videoId);
+    } catch (err1) {
+      console.warn(`[Direct] Failed: ${err1.message}`);
+      // Fallback: youtube-transcript library
       try {
-        const proxyStr = shuffledProxies[i];
-        const proxyIp = proxyStr.split(':')[0];
-        console.log(`[Method 1 - Direct] Trying proxy: ${proxyIp}`);
-        const agent = createProxyAgent(proxyStr);
-        if (agent) {
-          transcript = await fetchTranscriptDirect(videoId, agent);
-          if (transcript && transcript.length > 0) break;
-        }
-      } catch (err) {
-        console.warn(`[Method 1 - Direct] Proxy attempt ${i+1} failed: ${err.message}`);
-      }
-    }
-
-    // Try direct page scrape WITHOUT proxy if proxy fails or no proxies available
-    if (!transcript) {
-      try {
-        console.log(`[Method 1 - Direct] Trying WITHOUT proxy`);
-        transcript = await fetchTranscriptDirect(videoId, undefined);
-      } catch (err1) {
-        console.warn(`[Direct] Failed WITHOUT proxy: ${err1.message}`);
-        // Fallback: youtube-transcript library
-        try {
-          transcript = await YoutubeTranscript.fetchTranscript(videoId);
-        } catch (err2) {
-          console.warn(`[Library] Failed: ${err2.message}`);
-        }
+        transcript = await YoutubeTranscript.fetchTranscript(videoId);
+      } catch (err2) {
+        console.warn(`[Library] Failed: ${err2.message}`);
       }
     }
 
