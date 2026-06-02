@@ -112,24 +112,6 @@ async function getProxies() {
     console.warn('[Proxy Loader] Error reading proxies.txt:', err.message);
   }
 
-  // 3. Try from Supabase if credentials are provided in env
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
-  if (supabaseUrl && supabaseKey) {
-    try {
-      const { createClient } = await import('@supabase/supabase-js');
-      const supabase = createClient(supabaseUrl, supabaseKey);
-      const { data } = await supabase
-        .from('youtube_proxies')
-        .select('proxy_url')
-        .eq('is_active', true);
-      if (data) {
-        proxies.push(...data.map(d => d.proxy_url));
-      }
-    } catch (err) {
-      console.warn('[Proxy Loader] Error loading from Supabase:', err.message);
-    }
-  }
 
   // Deduplicate
   return [...new Set(proxies)];
