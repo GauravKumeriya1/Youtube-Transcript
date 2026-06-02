@@ -53,11 +53,7 @@
   });
 
   /* ── Fetch ─────────────────────────────────────────────── */
-  /* ── API endpoint config ────────────────────────────────── */
-  const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-  const API_BASE = isLocal
-    ? ''  // use local server
-    : 'https://transcriptgrab-api.gyanpur3.workers.dev';
+  const API_BASE = '';
 
   /* ── Fetch ─────────────────────────────────────────────── */
   async function handleFetch() {
