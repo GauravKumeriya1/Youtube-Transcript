@@ -35,12 +35,15 @@ const USER_AGENTS = [
 async function fetchTranscriptDirect(videoId) {
   const shuffledProxies = [...PROXY_LIST].sort(() => Math.random() - 0.5);
   let lastError = null;
+  const attempts = [];
 
   for (const proxyUrl of shuffledProxies) {
+    const proxyIp = proxyUrl.split('@')[1];
     const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
     const dispatcher = new ProxyAgent(proxyUrl);
 
     try {
+      attempts.push({ proxy: proxyIp, status: 'started' });
       // Step 1: Fetch the YouTube video page
       const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
         headers: {
@@ -48,18 +51,28 @@ async function fetchTranscriptDirect(videoId) {
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept': 'text/html,application/xhtml+xml',
         },
-        dispatcher
+        dispatcher,
+        signal: AbortSignal.timeout(6000)
       });
+
+      attempts[attempts.length - 1].statusCode = pageRes.status;
 
       if (!pageRes.ok) {
         throw new Error(`YouTube page returned ${pageRes.status}`);
       }
 
       const html = await pageRes.text();
+      attempts[attempts.length - 1].htmlLength = html.length;
 
       // Step 2: Extract captions data from the page
       const captionsMatch = html.match(/"captions":\s*(\{.*?"playerCaptionsTracklistRenderer".*?\})\s*,\s*"videoDetails"/s);
       if (!captionsMatch) {
+        if (html.includes('playabilityStatus')) {
+          attempts[attempts.length - 1].playability = true;
+        }
+        if (html.includes('Our systems have detected unusual traffic')) {
+          throw new Error('BLOCKED_BY_CAPTCHA');
+        }
         if (html.includes('"playabilityStatus"') && html.includes('"reason"')) {
           throw new Error('VIDEO_UNAVAILABLE');
         }
@@ -88,7 +101,8 @@ async function fetchTranscriptDirect(videoId) {
       const captionUrl = track.baseUrl + '&fmt=json3';
       const captionRes = await fetch(captionUrl, {
         headers: { 'User-Agent': ua },
-        dispatcher
+        dispatcher,
+        signal: AbortSignal.timeout(6000)
       });
 
       if (!captionRes.ok) {
@@ -119,12 +133,14 @@ async function fetchTranscriptDirect(videoId) {
       return transcript;
 
     } catch (err) {
-      console.warn(`Proxy ${proxyUrl.split('@')[1]} failed: ${err.message}`);
+      attempts[attempts.length - 1].error = err.message;
       lastError = err;
     }
   }
 
-  throw lastError || new Error('All proxies failed');
+  const finalErr = new Error(lastError ? lastError.message : 'All proxies failed');
+  finalErr.attempts = attempts;
+  throw finalErr;
 }
 
 /* ── Transcript API ─────────────────────────────────────── */
@@ -152,6 +168,7 @@ app.get('/api/transcript', async (req, res) => {
     // 2. Try fetching transcript — 3 methods with fallbacks
     let transcript = null;
     let errorMsg = '';
+    let debugInfo = null;
 
     // Method 1: Direct page scrape (most reliable on Vercel)
     try {
@@ -159,6 +176,7 @@ app.get('/api/transcript', async (req, res) => {
       transcript = await fetchTranscriptDirect(videoId);
     } catch (err1) {
       console.warn(`[Method 1 - Direct] Failed: ${err1.message}`);
+      debugInfo = err1.attempts || [];
 
       // Method 2: youtube-transcript library
       try {
@@ -210,7 +228,8 @@ app.get('/api/transcript', async (req, res) => {
       videoId,
       title,
       author,
-      error: transcript ? null : errorMsg
+      error: transcript ? null : errorMsg,
+      debug: debugInfo
     });
 
   } catch (unexpectedErr) {
