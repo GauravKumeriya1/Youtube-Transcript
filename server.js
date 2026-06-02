@@ -98,17 +98,46 @@ app.get('/api/transcript', async (req, res) => {
       author = info.author_name || '';
     } catch (_) { /* metadata is optional */ }
 
-    // Try Method 1: Direct page scrape
+    // Method 0: Supadata API (if API key is present)
     let transcript = null;
-    try {
-      transcript = await fetchTranscriptDirect(videoId);
-    } catch (err1) {
-      console.warn(`[Direct] Failed: ${err1.message}`);
-      // Fallback: youtube-transcript library
+    const supadataApiKey = process.env.SUPADATA_API_KEY;
+    if (supadataApiKey) {
       try {
-        transcript = await YoutubeTranscript.fetchTranscript(videoId);
-      } catch (err2) {
-        console.warn(`[Library] Failed: ${err2.message}`);
+        console.log(`[Method 0 - Supadata] Fetching ${videoId}`);
+        const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const res = await fetch(`https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(ytUrl)}&text=false&lang=en`, {
+          headers: {
+            'x-api-key': supadataApiKey,
+          },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          transcript = (data.content || []).map(item => ({
+            text: item.text,
+            offset: item.offset || 0,
+            duration: item.duration || 0,
+            lang: item.lang || data.lang || 'en'
+          }));
+        } else {
+          console.warn(`[Method 0 - Supadata] Failed with status ${res.status}`);
+        }
+      } catch (err) {
+        console.warn(`[Method 0 - Supadata] Error: ${err.message}`);
+      }
+    }
+
+    if (!transcript) {
+      // Try Method 1: Direct page scrape
+      try {
+        transcript = await fetchTranscriptDirect(videoId);
+      } catch (err1) {
+        console.warn(`[Direct] Failed: ${err1.message}`);
+        // Fallback: youtube-transcript library
+        try {
+          transcript = await YoutubeTranscript.fetchTranscript(videoId);
+        } catch (err2) {
+          console.warn(`[Library] Failed: ${err2.message}`);
+        }
       }
     }
 

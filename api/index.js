@@ -119,53 +119,82 @@ app.get('/api/transcript', async (req, res) => {
     let transcript = null;
     let errorMsg = '';
 
-    // Method 1: Direct page scrape (most reliable on Vercel)
-    try {
-      console.log(`[Method 1 - Direct] Fetching ${videoId}`);
-      transcript = await fetchTranscriptDirect(videoId);
-    } catch (err1) {
-      console.warn(`[Method 1 - Direct] Failed: ${err1.message}`);
-
-      // Method 2: youtube-transcript library
+    // Method 0: Supadata API (if API key is present)
+    const supadataApiKey = process.env.SUPADATA_API_KEY;
+    if (supadataApiKey) {
       try {
-        console.log(`[Method 2 - Library] Fetching ${videoId}`);
-        transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
-      } catch (err2) {
-        console.warn(`[Method 2 - Library] Failed: ${err2.message}`);
+        console.log(`[Method 0 - Supadata] Fetching ${videoId}`);
+        const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const res = await fetch(`https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(ytUrl)}&text=false&lang=en`, {
+          headers: {
+            'x-api-key': supadataApiKey,
+          },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          transcript = (data.content || []).map(item => ({
+            text: item.text,
+            offset: item.offset || 0,
+            duration: item.duration || 0,
+            lang: item.lang || data.lang || 'en'
+          }));
+        } else {
+          console.warn(`[Method 0 - Supadata] Failed with status ${res.status}`);
+        }
+      } catch (err) {
+        console.warn(`[Method 0 - Supadata] Error: ${err.message}`);
+      }
+    }
 
-        // Method 3: youtube-captions-scraper fallback
-        const langs = ['en', 'en-US', 'en-GB'];
-        for (const lang of langs) {
-          try {
-            console.log(`[Method 3 - Scraper] Trying lang=${lang} for ${videoId}`);
-            const subs = await getSubtitles({ videoID: videoId, lang });
-            if (subs && subs.length > 0) {
-              transcript = subs.map(t => ({
-                text: t.text,
-                offset: parseFloat(t.start) * 1000,
-                duration: parseFloat(t.dur) * 1000
-              }));
-              break;
+    if (!transcript) {
+      // Method 1: Direct page scrape (most reliable on Vercel)
+      try {
+        console.log(`[Method 1 - Direct] Fetching ${videoId}`);
+        transcript = await fetchTranscriptDirect(videoId);
+      } catch (err1) {
+        console.warn(`[Method 1 - Direct] Failed: ${err1.message}`);
+
+        // Method 2: youtube-transcript library
+        try {
+          console.log(`[Method 2 - Library] Fetching ${videoId}`);
+          transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+        } catch (err2) {
+          console.warn(`[Method 2 - Library] Failed: ${err2.message}`);
+
+          // Method 3: youtube-captions-scraper fallback
+          const langs = ['en', 'en-US', 'en-GB'];
+          for (const lang of langs) {
+            try {
+              console.log(`[Method 3 - Scraper] Trying lang=${lang} for ${videoId}`);
+              const subs = await getSubtitles({ videoID: videoId, lang });
+              if (subs && subs.length > 0) {
+                transcript = subs.map(t => ({
+                  text: t.text,
+                  offset: parseFloat(t.start) * 1000,
+                  duration: parseFloat(t.dur) * 1000
+                }));
+                break;
+              }
+            } catch (err3) {
+              console.warn(`[Method 3 - Scraper] lang=${lang} failed: ${err3.message}`);
             }
-          } catch (err3) {
-            console.warn(`[Method 3 - Scraper] lang=${lang} failed: ${err3.message}`);
           }
         }
-      }
 
-      // Determine error from Method 1's error (most informative)
-      if (!transcript) {
-        const msg = err1.message || '';
-        if (msg === 'CAPTIONS_DISABLED') {
-          errorMsg = 'Transcripts are disabled for this video.';
-        } else if (msg === 'VIDEO_UNAVAILABLE') {
-          errorMsg = 'This video is unavailable or does not exist.';
-        } else if (msg === 'CAPTIONS_NOT_AVAILABLE' || msg === 'CAPTIONS_EMPTY') {
-          errorMsg = 'No captions/transcript available for this video.';
-        } else if (msg.includes('429') || msg.includes('Too many')) {
-          errorMsg = 'YouTube is rate-limiting requests. Please try again later or run the app locally.';
-        } else {
-          errorMsg = 'Could not extract transcript. YouTube may be blocking this server — try running the app locally.';
+        // Determine error from Method 1's error (most informative)
+        if (!transcript) {
+          const msg = err1.message || '';
+          if (msg === 'CAPTIONS_DISABLED') {
+            errorMsg = 'Transcripts are disabled for this video.';
+          } else if (msg === 'VIDEO_UNAVAILABLE') {
+            errorMsg = 'This video is unavailable or does not exist.';
+          } else if (msg === 'CAPTIONS_NOT_AVAILABLE' || msg === 'CAPTIONS_EMPTY') {
+            errorMsg = 'No captions/transcript available for this video.';
+          } else if (msg.includes('429') || msg.includes('Too many')) {
+            errorMsg = 'YouTube is rate-limiting requests. Please try again later or run the app locally.';
+          } else {
+            errorMsg = 'Could not extract transcript. YouTube may be blocking this server — try running the app locally.';
+          }
         }
       }
     }
