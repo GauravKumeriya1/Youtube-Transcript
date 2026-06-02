@@ -6,3 +6,5 @@ package-lock.json
 
 .vercel
 .wrangler/
+proxies.txt
+
