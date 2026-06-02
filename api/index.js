@@ -1,10 +1,65 @@
 import express from 'express';
 import { YoutubeTranscript } from 'youtube-transcript';
 import { createRequire } from 'module';
+import fs from 'fs';
+import path from 'path';
+import { ProxyAgent } from 'undici';
+
 const require = createRequire(import.meta.url);
 const { getSubtitles } = require('youtube-captions-scraper');
 
 const app = express();
+
+/* ── Proxy Loader Helpers ───────────────────────────────── */
+async function getProxies() {
+  const proxies = [];
+
+  // 1. Try from environment variable PROXIES or PROXY_LIST
+  if (process.env.PROXIES) {
+    const list = process.env.PROXIES.split(',').map(p => p.trim()).filter(Boolean);
+    proxies.push(...list);
+  } else if (process.env.PROXY_LIST) {
+    const list = process.env.PROXY_LIST.split(',').map(p => p.trim()).filter(Boolean);
+    proxies.push(...list);
+  }
+
+  // 2. Try from local proxies.txt file
+  try {
+    const txtPath = path.join(process.cwd(), 'proxies.txt');
+    if (fs.existsSync(txtPath)) {
+      const content = fs.readFileSync(txtPath, 'utf8');
+      const list = content.split('\n').map(p => p.trim()).filter(p => p && !p.startsWith('#'));
+      proxies.push(...list);
+    }
+  } catch (err) {
+    console.warn('[Proxy Loader] Error reading proxies.txt:', err.message);
+  }
+
+  return [...new Set(proxies)];
+}
+
+function createProxyAgent(proxyStr) {
+  try {
+    if (proxyStr.startsWith('http://') || proxyStr.startsWith('https://')) {
+      return new ProxyAgent({ uri: proxyStr });
+    }
+    const parts = proxyStr.split(':');
+    const ip = parts[0];
+    const port = parts[1];
+    const user = parts[2];
+    const pass = parts[3];
+    if (ip && port) {
+      let proxyUrl = `http://${ip}:${port}`;
+      if (user && pass) {
+        proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
+      }
+      return new ProxyAgent({ uri: proxyUrl });
+    }
+  } catch (error) {
+    console.error('[ProxyAgent] Error creating agent:', error);
+  }
+  return undefined;
+}
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -13,17 +68,23 @@ const USER_AGENTS = [
 ];
 
 /* ── Direct page-scrape transcript fetcher (best for Vercel) ── */
-async function fetchTranscriptDirect(videoId) {
+async function fetchTranscriptDirect(videoId, agent) {
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
-  // Step 1: Fetch the YouTube video page
-  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+  const fetchOptions = {
     headers: {
       'User-Agent': ua,
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept': 'text/html,application/xhtml+xml',
     }
-  });
+  };
+
+  if (agent) {
+    fetchOptions.dispatcher = agent;
+  }
+
+  // Step 1: Fetch the YouTube video page
+  const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, fetchOptions);
 
   if (!pageRes.ok) {
     throw new Error(`YouTube page returned ${pageRes.status}`);
@@ -61,9 +122,13 @@ async function fetchTranscriptDirect(videoId) {
 
   // Step 4: Fetch the transcript XML from YouTube's timedtext CDN
   const captionUrl = track.baseUrl + '&fmt=json3';
-  const captionRes = await fetch(captionUrl, {
+  const captionOptions = {
     headers: { 'User-Agent': ua }
-  });
+  };
+  if (agent) {
+    captionOptions.dispatcher = agent;
+  }
+  const captionRes = await fetch(captionUrl, captionOptions);
 
   if (!captionRes.ok) {
     throw new Error(`Caption fetch returned ${captionRes.status}`);
@@ -102,57 +167,85 @@ app.get('/api/transcript', async (req, res) => {
     const videoId = extractVideoId(url);
     if (!videoId) return res.status(400).json({ success: false, error: 'Invalid YouTube URL. Please paste a valid YouTube link or video ID.' });
 
+    // Load proxies and shuffle
+    const proxies = await getProxies();
+    const shuffledProxies = [...proxies].sort(() => Math.random() - 0.5);
+
     // 1. Fetch Metadata
     let [title, author] = ['Untitled Video', 'Unknown Channel'];
-    try {
-      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-      if (oembedRes.ok) {
-        const info = await oembedRes.json();
-        title = info.title || title;
-        author = info.author_name || author;
+    const tryFetchMetadata = async (agent) => {
+      const fetchOptions = {};
+      if (agent) {
+        fetchOptions.dispatcher = agent;
       }
-    } catch (err) {
-      console.error('Metadata fetch error:', err.message);
+      const oembedRes = await fetch(
+        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+        fetchOptions
+      );
+      if (oembedRes.ok) {
+        return await oembedRes.json();
+      }
+      throw new Error(`oEmbed failed with status ${oembedRes.status}`);
+    };
+
+    let metadata = null;
+    const maxMetadataProxyAttempts = Math.min(3, shuffledProxies.length);
+    for (let i = 0; i < maxMetadataProxyAttempts; i++) {
+      try {
+        const agent = createProxyAgent(shuffledProxies[i]);
+        if (agent) {
+          metadata = await tryFetchMetadata(agent);
+          if (metadata) break;
+        }
+      } catch (err) {
+        console.warn(`[Metadata Proxy Attempt failed]: ${err.message}`);
+      }
+    }
+
+    if (!metadata) {
+      try {
+        metadata = await tryFetchMetadata(undefined);
+      } catch (err) {
+        console.warn(`[Metadata WITHOUT proxy failed]: ${err.message}`);
+      }
+    }
+
+    if (metadata) {
+      title = metadata.title || title;
+      author = metadata.author_name || author;
     }
 
     // 2. Try fetching transcript — 3 methods with fallbacks
     let transcript = null;
     let errorMsg = '';
+    let lastDirectError = null;
 
-    // Method 0: Supadata API (if API key is present)
-    const supadataApiKey = process.env.SUPADATA_API_KEY;
-    if (supadataApiKey) {
+    // Method 1: Direct page scrape (most reliable with proxy)
+    const maxDirectProxyAttempts = Math.min(3, shuffledProxies.length);
+    for (let i = 0; i < maxDirectProxyAttempts; i++) {
       try {
-        console.log(`[Method 0 - Supadata] Fetching ${videoId}`);
-        const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        const res = await fetch(`https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(ytUrl)}&text=false&lang=en`, {
-          headers: {
-            'x-api-key': supadataApiKey,
-          },
-        });
-        if (res.ok) {
-          const data = await res.json();
-          transcript = (data.content || []).map(item => ({
-            text: item.text,
-            offset: item.offset || 0,
-            duration: item.duration || 0,
-            lang: item.lang || data.lang || 'en'
-          }));
-        } else {
-          console.warn(`[Method 0 - Supadata] Failed with status ${res.status}`);
+        const proxyStr = shuffledProxies[i];
+        const proxyIp = proxyStr.split(':')[0];
+        console.log(`[Method 1 - Direct] Trying proxy: ${proxyIp}`);
+        const agent = createProxyAgent(proxyStr);
+        if (agent) {
+          transcript = await fetchTranscriptDirect(videoId, agent);
+          if (transcript && transcript.length > 0) break;
         }
       } catch (err) {
-        console.warn(`[Method 0 - Supadata] Error: ${err.message}`);
+        console.warn(`[Method 1 - Direct] Proxy attempt ${i+1} failed: ${err.message}`);
+        lastDirectError = err;
       }
     }
 
+    // Try direct page scrape WITHOUT proxy if proxy fails or no proxies available
     if (!transcript) {
-      // Method 1: Direct page scrape (most reliable on Vercel)
       try {
-        console.log(`[Method 1 - Direct] Fetching ${videoId}`);
-        transcript = await fetchTranscriptDirect(videoId);
+        console.log(`[Method 1 - Direct] Trying WITHOUT proxy`);
+        transcript = await fetchTranscriptDirect(videoId, undefined);
       } catch (err1) {
-        console.warn(`[Method 1 - Direct] Failed: ${err1.message}`);
+        console.warn(`[Method 1 - Direct] Failed WITHOUT proxy: ${err1.message}`);
+        lastDirectError = err1;
 
         // Method 2: youtube-transcript library
         try {
@@ -180,22 +273,22 @@ app.get('/api/transcript', async (req, res) => {
             }
           }
         }
+      }
+    }
 
-        // Determine error from Method 1's error (most informative)
-        if (!transcript) {
-          const msg = err1.message || '';
-          if (msg === 'CAPTIONS_DISABLED') {
-            errorMsg = 'Transcripts are disabled for this video.';
-          } else if (msg === 'VIDEO_UNAVAILABLE') {
-            errorMsg = 'This video is unavailable or does not exist.';
-          } else if (msg === 'CAPTIONS_NOT_AVAILABLE' || msg === 'CAPTIONS_EMPTY') {
-            errorMsg = 'No captions/transcript available for this video.';
-          } else if (msg.includes('429') || msg.includes('Too many')) {
-            errorMsg = 'YouTube is rate-limiting requests. Please try again later or run the app locally.';
-          } else {
-            errorMsg = 'Could not extract transcript. YouTube may be blocking this server — try running the app locally.';
-          }
-        }
+    // Determine error from Method 1's error (most informative)
+    if (!transcript) {
+      const msg = lastDirectError?.message || '';
+      if (msg === 'CAPTIONS_DISABLED') {
+        errorMsg = 'Transcripts are disabled for this video.';
+      } else if (msg === 'VIDEO_UNAVAILABLE') {
+        errorMsg = 'This video is unavailable or does not exist.';
+      } else if (msg === 'CAPTIONS_NOT_AVAILABLE' || msg === 'CAPTIONS_EMPTY') {
+        errorMsg = 'No captions/transcript available for this video.';
+      } else if (msg.includes('429') || msg.includes('Too many')) {
+        errorMsg = 'YouTube is rate-limiting requests. Please try again later or configure proxies.';
+      } else {
+        errorMsg = 'Could not extract transcript. YouTube may be blocking this server.';
       }
     }
 
