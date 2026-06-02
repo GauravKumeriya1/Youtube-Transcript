@@ -1,17 +1,14 @@
-import http from 'http';
-import url from 'url';
+import express from 'express';
 import { YoutubeTranscript } from 'youtube-transcript';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { ProxyAgent } from 'undici';
-import dotenv from 'dotenv';
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const app = express();
 const PORT = 3001;
 
 const USER_AGENTS = [
@@ -100,9 +97,9 @@ async function getProxies() {
     proxies.push(...list);
   }
 
-  // 2. Try from local proxies.txt file
+  // 2. Try from local proxies.txt file (relative to __dirname for Vercel bundling)
   try {
-    const txtPath = path.join(process.cwd(), 'proxies.txt');
+    const txtPath = path.join(__dirname, 'proxies.txt');
     if (fs.existsSync(txtPath)) {
       const content = fs.readFileSync(txtPath, 'utf8');
       const list = content.split('\n').map(p => p.trim()).filter(p => p && !p.startsWith('#'));
@@ -112,8 +109,6 @@ async function getProxies() {
     console.warn('[Proxy Loader] Error reading proxies.txt:', err.message);
   }
 
-
-  // Deduplicate
   return [...new Set(proxies)];
 }
 
@@ -141,174 +136,154 @@ function createProxyAgent(proxyStr) {
 }
 
 /* ── Transcript API ─────────────────────────────────────── */
-const server = http.createServer(async (req, res) => {
-  // Set CORS and content type headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'application/json');
-
-  const parsedUrl = url.parse(req.url, true);
-
-  if (parsedUrl.pathname === '/api/transcript' && req.method === 'GET') {
-    try {
-      const urlParam = parsedUrl.query.url;
-      if (!urlParam) {
-        res.writeHead(400);
-        return res.end(JSON.stringify({ success: false, error: 'YouTube URL is required' }));
-      }
-
-      const videoId = extractVideoId(urlParam);
-      if (!videoId) {
-        res.writeHead(400);
-        return res.end(JSON.stringify({ success: false, error: 'Invalid YouTube URL' }));
-      }
-
-      // Load active proxies and shuffle
-      const proxies = await getProxies();
-      const shuffledProxies = [...proxies].sort(() => Math.random() - 0.5);
-
-      // Fetch video metadata via oEmbed (with proxy retries and fallback to no-proxy)
-      let title = '', author = '';
-      const tryFetchMetadata = async (agent) => {
-        const canonical = `https://www.youtube.com/watch?v=${videoId}`;
-        const fetchOptions = {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        };
-        if (agent) {
-          fetchOptions.dispatcher = agent;
-        }
-        const oembedRes = await fetch(
-          `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`,
-          fetchOptions
-        );
-        if (oembedRes.ok) {
-          return await oembedRes.json();
-        }
-        throw new Error(`oEmbed failed with status ${oembedRes.status}`);
-      };
-
-      let metadata = null;
-      const maxMetadataProxyAttempts = Math.min(3, shuffledProxies.length);
-      for (let i = 0; i < maxMetadataProxyAttempts; i++) {
-        try {
-          const proxyStr = shuffledProxies[i];
-          const proxyIp = proxyStr.split(':')[0];
-          console.log(`[Metadata] Attempt ${i + 1}/${maxMetadataProxyAttempts} using proxy: ${proxyIp}`);
-          const agent = createProxyAgent(proxyStr);
-          if (agent) {
-            metadata = await tryFetchMetadata(agent);
-            if (metadata) break;
-          }
-        } catch (err) {
-          console.warn(`[Metadata Proxy Attempt failed]: ${err.message}`);
-        }
-      }
-
-      if (!metadata) {
-        try {
-          console.log(`[Metadata] Trying WITHOUT proxy`);
-          metadata = await tryFetchMetadata(undefined);
-        } catch (err) {
-          console.warn(`[Metadata WITHOUT proxy failed]: ${err.message}`);
-        }
-      }
-
-      if (metadata) {
-        title = metadata.title || '';
-        author = metadata.author_name || '';
-      }
-
-      // Fetch transcript content
-      let transcript = null;
-      const errors = {};
-
-      // Try Method 1: Direct page scrape with proxy retries
-      const maxDirectProxyAttempts = Math.min(3, shuffledProxies.length);
-      for (let i = 0; i < maxDirectProxyAttempts; i++) {
-        const proxyStr = shuffledProxies[i];
-        const proxyIp = proxyStr.split(':')[0];
-        try {
-          console.log(`[Direct] Attempt ${i + 1}/${maxDirectProxyAttempts} using proxy: ${proxyIp}`);
-          const agent = createProxyAgent(proxyStr);
-          if (agent) {
-            transcript = await fetchTranscriptDirect(videoId, agent);
-            if (transcript && transcript.length > 0) break;
-          }
-        } catch (err) {
-          console.warn(`[Direct Proxy Attempt failed]: ${err.message}`);
-          errors[`proxy_${proxyIp}`] = err.message;
-        }
-      }
-
-      // If no success with proxies, try direct page scrape WITHOUT proxy
-      if (!transcript) {
-        try {
-          console.log(`[Direct] Trying WITHOUT proxy`);
-          transcript = await fetchTranscriptDirect(videoId, undefined);
-        } catch (err1) {
-          console.warn(`[Direct] Failed WITHOUT proxy: ${err1.message}`);
-          errors['direct_no_proxy'] = err1.message;
-
-          // Fallback: youtube-transcript library (always WITHOUT proxy)
-          try {
-            console.log(`[Library] Trying youtube-transcript`);
-            transcript = await YoutubeTranscript.fetchTranscript(videoId);
-          } catch (err2) {
-            console.warn(`[Library] Failed: ${err2.message}`);
-            errors['library'] = err2.message;
-          }
-        }
-      }
-
-      if (transcript) {
-        const segments = transcript.map(t => ({
-          start: Number((t.offset / 1000).toFixed(2)),
-          end: Number(((t.offset + t.duration) / 1000).toFixed(2)),
-          text: t.text
-        }));
-
-        const lastSeg = segments[segments.length - 1];
-        const duration = lastSeg ? Math.ceil(lastSeg.end) : 0;
-        const lang = transcript[0]?.lang || 'en';
-
-        res.writeHead(200);
-        res.end(JSON.stringify({
-          video: {
-            platform: 'youtube',
-            id: videoId,
-            title: title || 'Unknown Title',
-            author: author || 'Unknown Author',
-            thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
-          },
-          duration: duration,
-          transcripts: {
-            [lang]: {
-              segments: segments
-            }
-          }
-        }));
-      } else {
-        res.writeHead(400);
-        res.end(JSON.stringify({ 
-          success: false, 
-          error: 'Could not extract transcript. The video may not have captions available.',
-          details: errors
-        }));
-      }
-    } catch (err) {
-      res.writeHead(500);
-      res.end(JSON.stringify({ success: false, error: 'An unexpected server error occurred.' }));
+app.get('/api/transcript', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ success: false, error: 'YouTube URL is required' });
     }
-  } else {
-    // Handle 404 for other routes
-    res.writeHead(404);
-    res.end(JSON.stringify({ success: false, error: 'Not Found' }));
+
+    const videoId = extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ success: false, error: 'Invalid YouTube URL' });
+    }
+
+    // Load proxies and shuffle
+    const proxies = await getProxies();
+    const shuffledProxies = [...proxies].sort(() => Math.random() - 0.5);
+
+    // Fetch video metadata via oEmbed
+    let title = '', author = '';
+    const tryFetchMetadata = async (agent) => {
+      const canonical = `https://www.youtube.com/watch?v=${videoId}`;
+      const fetchOptions = {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+      };
+      if (agent) {
+        fetchOptions.dispatcher = agent;
+      }
+      const oembedRes = await fetch(
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`,
+        fetchOptions
+      );
+      if (oembedRes.ok) {
+        return await oembedRes.json();
+      }
+      throw new Error(`oEmbed failed with status ${oembedRes.status}`);
+    };
+
+    let metadata = null;
+    const maxMetadataProxyAttempts = Math.min(3, shuffledProxies.length);
+    for (let i = 0; i < maxMetadataProxyAttempts; i++) {
+      try {
+        const proxyStr = shuffledProxies[i];
+        const agent = createProxyAgent(proxyStr);
+        if (agent) {
+          metadata = await tryFetchMetadata(agent);
+          if (metadata) break;
+        }
+      } catch (err) {
+        console.warn(`[Metadata Proxy Attempt failed]: ${err.message}`);
+      }
+    }
+
+    if (!metadata) {
+      try {
+        metadata = await tryFetchMetadata(undefined);
+      } catch (err) {
+        console.warn(`[Metadata WITHOUT proxy failed]: ${err.message}`);
+      }
+    }
+
+    if (metadata) {
+      title = metadata.title || '';
+      author = metadata.author_name || '';
+    }
+
+    // Fetch transcript content
+    let transcript = null;
+    const errors = {};
+
+    // Try Method 1: Direct page scrape with proxy retries
+    const maxDirectProxyAttempts = Math.min(3, shuffledProxies.length);
+    for (let i = 0; i < maxDirectProxyAttempts; i++) {
+      const proxyStr = shuffledProxies[i];
+      const proxyIp = proxyStr.split(':')[0];
+      try {
+        console.log(`[Direct] Attempt ${i + 1}/${maxDirectProxyAttempts} using proxy: ${proxyIp}`);
+        const agent = createProxyAgent(proxyStr);
+        if (agent) {
+          transcript = await fetchTranscriptDirect(videoId, agent);
+          if (transcript && transcript.length > 0) break;
+        }
+      } catch (err) {
+        console.warn(`[Direct Proxy Attempt failed]: ${err.message}`);
+        errors[`proxy_${proxyIp}`] = err.message;
+      }
+    }
+
+    // If no success with proxies, try direct page scrape WITHOUT proxy
+    if (!transcript) {
+      try {
+        console.log(`[Direct] Trying WITHOUT proxy`);
+        transcript = await fetchTranscriptDirect(videoId, undefined);
+      } catch (err1) {
+        console.warn(`[Direct] Failed WITHOUT proxy: ${err1.message}`);
+        errors['direct_no_proxy'] = err1.message;
+
+        // Fallback: youtube-transcript library (always WITHOUT proxy)
+        try {
+          console.log(`[Library] Trying youtube-transcript`);
+          transcript = await YoutubeTranscript.fetchTranscript(videoId);
+        } catch (err2) {
+          console.warn(`[Library] Failed: ${err2.message}`);
+          errors['library'] = err2.message;
+        }
+      }
+    }
+
+    if (transcript) {
+      const segments = transcript.map(t => ({
+        start: Number((t.offset / 1000).toFixed(2)),
+        end: Number(((t.offset + t.duration) / 1000).toFixed(2)),
+        text: t.text
+      }));
+
+      const lastSeg = segments[segments.length - 1];
+      const duration = lastSeg ? Math.ceil(lastSeg.end) : 0;
+      const lang = transcript[0]?.lang || 'en';
+
+      res.json({
+        video: {
+          platform: 'youtube',
+          id: videoId,
+          title: title || 'Unknown Title',
+          author: author || 'Unknown Author',
+          thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+        },
+        duration: duration,
+        transcripts: {
+          [lang]: {
+            segments: segments
+          }
+        }
+      });
+    } else {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Could not extract transcript. The video may not have captions available.',
+        details: errors
+      });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'An unexpected server error occurred.' });
   }
 });
 
 /* ── Helpers ─────────────────────────────────────────────── */
-function extractVideoId(urlStr) {
+function extractVideoId(url) {
   const patterns = [
     /(?:youtube\.com\/watch\?.*v=)([a-zA-Z0-9_-]{11})/,
     /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
@@ -317,7 +292,7 @@ function extractVideoId(urlStr) {
     /^([a-zA-Z0-9_-]{11})$/,
   ];
   for (const p of patterns) {
-    const m = urlStr.trim().match(p);
+    const m = url.trim().match(p);
     if (m) return m[1];
   }
   return null;
@@ -325,9 +300,9 @@ function extractVideoId(urlStr) {
 
 /* ── Start ───────────────────────────────────────────────── */
 if (!process.env.VERCEL) {
-  server.listen(PORT, () => {
-    console.log(`\n  🎬 TranscriptGrab running (Node.js native) at http://localhost:${PORT}\n`);
+  app.listen(PORT, () => {
+    console.log(`\n  🎬 TranscriptGrab running at http://localhost:${PORT}\n`);
   });
 }
 
-export default server;
+export default app;
