@@ -9,6 +9,8 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3001;
 
+app.use(express.static(path.join(__dirname, 'public')));
+
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -111,31 +113,7 @@ app.get('/api/transcript', async (req, res) => {
     }
 
     if (transcript) {
-      const segments = transcript.map(t => ({
-        start: Number((t.offset / 1000).toFixed(2)),
-        end: Number(((t.offset + t.duration) / 1000).toFixed(2)),
-        text: t.text
-      }));
-
-      const lastSeg = segments[segments.length - 1];
-      const duration = lastSeg ? Math.ceil(lastSeg.end) : 0;
-      const lang = transcript[0]?.lang || 'en';
-
-      res.json({
-        video: {
-          platform: 'youtube',
-          id: videoId,
-          title: title || 'Unknown Title',
-          author: author || 'Unknown Author',
-          thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
-        },
-        duration: duration,
-        transcripts: {
-          [lang]: {
-            segments: segments
-          }
-        }
-      });
+      res.json({ success: true, transcript, title, author, videoId });
     } else {
       res.status(400).json({ success: false, error: 'Could not extract transcript. The video may not have captions available.' });
     }
